@@ -319,3 +319,146 @@ agentcore invoke "{'prompt': 'Tell me about Roaming Activations'}"
 | Recommended for | Quick prototyping | Production workloads |
 
 ---
+
+## AgentCore Memory
+
+### 18. Create Memory in AWS Console
+
+1. Go to **AWS Console** → search **Bedrock AgentCore**
+2. Navigate to **Memory** → **Create Memory**
+3. Set a name (e.g., `customercare_agent_memory`)
+4. AWS creates a `MEMORY_ID` in the format `<name>-<random-suffix>` (e.g., `customercare_agent_memory-VNlpNwG2Y0`)
+5. Note the **Memory ID** — it is required in `02_agentcore_memory.py`
+
+> Memory persists conversation history and user preferences across sessions using `AgentCoreMemorySaver` (short-term checkpointing) and `AgentCoreMemoryStore` (long-term semantic store).
+
+---
+
+### 19. Create `02_agentcore_memory.py`
+
+Copy `01_agentcore_runtime.py` → rename to `02_agentcore_memory.py`, then add:
+
+#### Key imports
+
+```python
+from langgraph_checkpoint_aws import AgentCoreMemorySaver, AgentCoreMemoryStore
+from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest, ModelResponse
+```
+
+#### Memory configuration
+
+```python
+MEMORY_ID = "customercare_agent_memory-VNlpNwG2Y0"  # From AWS Console
+
+checkpointer = AgentCoreMemorySaver(memory_id=MEMORY_ID)  # Short-term: tracks thread history
+store = AgentCoreMemoryStore(memory_id=MEMORY_ID)         # Long-term: semantic user memory
+```
+
+#### MemoryMiddleware hooks
+
+```python
+class MemoryMiddleware(AgentMiddleware):
+    def pre_model_hook(self, state, config, *, store):
+        # Saves latest human message; retrieves past preferences before LLM call
+        ...
+    def post_model_hook(self, state, config, *, store):
+        # Saves AI response to long-term memory after LLM call
+        ...
+```
+
+#### Create agent with memory
+
+```python
+agent = create_agent(
+    model=llm,
+    tools=tools,
+    checkpointer=checkpointer,   # Short-term memory (per thread)
+    store=store,                 # Long-term memory (across threads)
+    middleware=[MemoryMiddleware()],
+    system_prompt=system_prompt,
+)
+```
+
+#### Entrypoint — pass `actor_id` and `thread_id`
+
+```python
+@app.entrypoint
+def agent_invocation(payload, context):
+    actor_id  = payload.get("actor_id", "default-user")
+    thread_id = payload.get("thread_id", "default-session")
+    config = {"configurable": {"thread_id": thread_id, "actor_id": actor_id}}
+    result = agent.invoke({"messages": [("human", query)]}, config=config)
+    return {"result": result['messages'][-1].content, "actor_id": actor_id, "thread_id": thread_id}
+```
+
+| Memory Component | Role |
+|-----------------|------|
+| `AgentCoreMemorySaver` | Short-term checkpointer — persists message history per `thread_id` |
+| `AgentCoreMemoryStore` | Long-term store — semantic search across all sessions for an `actor_id` |
+| `pre_model_hook` | Runs before LLM call — saves human message, retrieves relevant past memories |
+| `post_model_hook` | Runs after LLM call — saves AI response to long-term store |
+
+---
+
+### 20. Deploy Memory Agent
+
+#### Configure
+
+```bash
+agentcore configure -e ./02_agentcore_memory.py --deployment-type container
+```
+
+#### Launch
+
+```bash
+agentcore launch --env GROQ_API_KEY=gsk_... --env OPENAI_API_KEY=sk-proj-...
+```
+
+#### Test via CLI
+
+```bash
+agentcore invoke "{'prompt': 'What is famous in the Country that I Referred?'}"
+```
+
+---
+
+### 21. Invoke Runtime Externally via `invoke.py`
+
+Use `invoke.py` to call any deployed AgentCore runtime directly via the **boto3 SDK** — no CLI needed.
+
+```python
+import boto3, json, uuid
+
+def create_runtime_session_id() -> str:
+    """Each unique session ID creates a new MicroVM (must be 33+ chars)."""
+    return f"session-{uuid.uuid4()}"   # 44 chars
+
+client = boto3.client('bedrock-agentcore', region_name='us-east-1')
+payload = json.dumps({"prompt": "What is famous in the Country that I Referred?"})
+
+response = client.invoke_agent_runtime(
+    agentRuntimeArn='arn:aws:bedrock-agentcore:<region>:<account-id>:runtime/<runtime-id>',
+    runtimeSessionId=create_runtime_session_id(),
+    payload=payload,
+    qualifier="DEFAULT"  # Optional — omit to use the DEFAULT endpoint
+)
+response_data = json.loads(response['response'].read())
+print("Agent Response:", response_data)
+```
+
+#### Key parameters
+
+| Parameter | Where to find it | Notes |
+|-----------|-----------------|-------|
+| `agentRuntimeArn` | AWS Console → Bedrock AgentCore → Agent Runtimes → copy ARN | Required |
+| `runtimeSessionId` | Generate locally — must be 33+ chars | Each new ID = new MicroVM |
+| `qualifier` | AWS Console → Agent Runtime → Endpoints tab → copy Endpoint ARN | Optional; defaults to `DEFAULT` |
+| `region_name` | Must match the region where the agent is deployed | Required |
+
+#### Run
+
+```bash
+python invoke.py
+```
+
+---
