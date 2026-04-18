@@ -205,6 +205,117 @@ agentcore launch --env GROQ_API_KEY=gsk --env OPENAI_API_KEY=sk-proj
 | Method | Status | Description |
 |--------|--------|-------------|
 | Direct Code Deploy | ✅ Done | Source code is packaged and deployed directly. Used in the steps above. |
-| Docker Container Deploy | 🔜 Coming Soon | Deploy using a custom Docker image for full environment control. *(Details to be added)* |
+| Docker Container Deploy | ✅ Done | Deploy using a custom Docker image for full environment control. See steps below. |
+
+---
+
+## Docker Container Deployment
+
+### 14. Reconfigure Agent for Docker Container Deploy
+
+Run the configure command with the `--deployment-type container` flag and specify the target platform. This regenerates the `.bedrock_agentcore.yaml` and auto-generates a `Dockerfile` under `.bedrock_agentcore/<agent-name>/`:
+
+```bash
+agentcore configure -e ./01_agentcore_runtime.py --deployment-type container
+```
+
+The generated `.bedrock_agentcore.yaml` will look like:
+
+```yaml
+default_agent: agentcore_lang_docker_runtime
+agents:
+  agentcore_lang_docker_runtime:
+    name: agentcore_lang_docker_runtime
+    language: python
+    entrypoint: ./01_agentcore_runtime.py
+    deployment_type: container
+    platform: linux/arm64
+```
+
+> **Note:** The `platform` defaults to `linux/arm64`. Change to `linux/amd64` if your target environment requires it.
+
+---
+
+### 15. Review the Auto-Generated Dockerfile
+
+The toolkit generates a `Dockerfile` at `.bedrock_agentcore/agentcore_lang_docker_runtime/Dockerfile`. Key details:
+
+```dockerfile
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+WORKDIR /app
+
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_PROGRESS=1 \
+    PYTHONUNBUFFERED=1 \
+    DOCKER_CONTAINER=1 \
+    AWS_REGION=us-east-1 \
+    AWS_DEFAULT_REGION=us-east-1
+
+COPY . .
+RUN cd . && uv pip install .
+RUN uv pip install aws-opentelemetry-distro==0.12.2
+
+# Run as non-root user
+RUN useradd -m -u 1000 bedrock_agentcore
+USER bedrock_agentcore
+
+EXPOSE 9000
+EXPOSE 8000
+EXPOSE 8080
+
+CMD ["opentelemetry-instrument", "python", "-m", "01_agentcore_runtime"]
+```
+
+> **Security note:** The container runs as a non-root user (`bedrock_agentcore`, UID 1000) for least-privilege execution.
+
+---
+
+### 16. Build & Push Docker Image to Amazon ECR
+
+The `agentcore launch` command builds the Docker image, pushes it to Amazon Elastic Container Registry (ECR), and deploys it to AWS Bedrock AgentCore Runtime in a single step:
+
+```bash
+agentcore launch --env GROQ_API_KEY=gsk_... --env OPENAI_API_KEY=sk-proj-...
+```
+
+#### What happens under the hood
+
+```
+agentcore launch
+    └─> Reads .bedrock_agentcore.yaml (deployment_type: container)
+            └─> Builds Docker image from .bedrock_agentcore/agentcore_lang_docker_runtime/Dockerfile
+                    └─> Creates/reuses an ECR repository and pushes the image
+                            └─> Deploys the container to AWS Bedrock AgentCore Runtime
+                                    └─> Agent is live and ready to receive invocations
+```
+
+| Phase | Description |
+|-------|-------------|
+| **Build** | Docker image is built locally using the auto-generated `Dockerfile`. |
+| **Push** | Image is tagged and pushed to an Amazon ECR private repository in your AWS account. |
+| **Deploy** | AWS Bedrock AgentCore Runtime pulls the image from ECR and starts the container. |
+| **Runtime** | The container starts an HTTP server; AWS Bedrock routes invocation requests to `@app.entrypoint`. |
+
+---
+
+### 17. Invoke the Deployed Docker Agent
+
+```bash
+agentcore invoke "{'prompt': 'Tell me about Roaming Activations'}"
+```
+
+---
+
+### Docker vs Direct Code Deploy — Comparison
+
+| Aspect | Direct Code Deploy | Docker Container Deploy |
+|--------|--------------------|------------------------|
+| Build step | None | Docker image build + ECR push |
+| Environment control | Managed by Bedrock | Full control via `Dockerfile` |
+| Custom system dependencies | Not supported | Supported (add to `Dockerfile`) |
+| Reproducibility | Runtime-managed | Image-pinned |
+| Cold start | Faster | Slightly slower (image pull) |
+| Recommended for | Quick prototyping | Production workloads |
 
 ---
